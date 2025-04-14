@@ -3,6 +3,9 @@ import logging
 import os
 from typing import Optional
 import json
+from tqdm import tqdm
+from datetime import datetime, timedelta
+import argparse
 
 logger = logging.getLogger(__name__)
 
@@ -85,53 +88,67 @@ def clean_invalid_results(db_path: str) -> None:
         logger.error(f"Error cleaning invalid results: {str(e)}")
         raise
 
+def parse_time(t_str):
+    # Assumes HH:MM:SS format
+    return datetime.strptime(t_str, "%H:%M")
+
 def adjust_order_times(db_path: str) -> None:
     """Adjust order times for tests within one minute for each patient."""
     try:
         conn = connect_db(db_path)
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        # Step 1: Create a temporary table to hold adjusted times
+        logger.info("Fetching relevant rows...")
         cursor.execute("""
-            CREATE TEMPORARY TABLE temp_adjusted AS
-            SELECT Patientnummer, 
-                   Testcode, 
-                   MIN(VerzamelTijd) AS FirstTime,
-                   VerzamelDatum
+            SELECT RowID, Patientnummer, VerzamelDatum, VerzamelTijd
             FROM labosys
-            GROUP BY Patientnummer, VerzamelDatum
-            HAVING COUNT(*) > 1
+            ORDER BY Patientnummer, VerzamelDatum, VerzamelTijd
         """)
+        rows = cursor.fetchall()
+        logger.info(f"Processing {len(rows)} rows...")
 
-        # Step 2: Update the original labosys table with the adjusted times
-        cursor.execute("""
-            UPDATE labosys
-            SET VerzamelTijd = (
-                SELECT MIN(l2.VerzamelTijd)
-                FROM labosys l2 
-                WHERE l2.Patientnummer = labosys.Patientnummer
-                AND l2.VerzamelDatum = labosys.VerzamelDatum
-            )
-            WHERE EXISTS (
-                SELECT 1
-                FROM labosys l3
-                WHERE l3.Patientnummer = labosys.Patientnummer
-                AND l3.VerzamelDatum = labosys.VerzamelDatum
-                GROUP BY l3.Patientnummer, l3.VerzamelDatum
-                HAVING COUNT(*) > 1
-            )
-        """)
+        updates = []
+        group = []
+        prev_key = None
+        prev_time = None
 
-        # Drop the index we created
-        cursor.execute("DROP INDEX IF EXISTS idx_patient_date")
-        
+        for row in tqdm(rows, desc="Analyzing groups"):
+            key = (row["Patientnummer"], row["VerzamelDatum"])
+            time_obj = parse_time(row["VerzamelTijd"])
+
+            if prev_key == key and (time_obj - prev_time <= timedelta(minutes=1)):
+                group.append((row["RowID"], time_obj))
+            else:
+                # finalize previous group
+                if len(group) > 1:
+                    min_time = min(t for _, t in group).strftime("%H:%M:%S")
+                    updates.extend((row_id, min_time) for row_id, _ in group)
+                group = [(row["RowID"], time_obj)]
+            prev_key = key
+            prev_time = time_obj
+
+        # handle last group
+        if len(group) > 1:
+            min_time = min(t for _, t in group).strftime("%H:%M:%S")
+            updates.extend((row_id, min_time) for row_id, _ in group)
+
+        logger.info(f"Applying {len(updates)} updates...")
+        for row_id, new_time in tqdm(updates, desc="Updating DB"):
+            cursor.execute("""
+                UPDATE labosys
+                SET VerzamelTijd = ?
+                WHERE RowID = ?
+            """, (new_time, row_id))
+
         conn.commit()
         conn.close()
-        logger.info("Adjusted order times for tests within one minute.")
+        logger.info("Order times adjusted successfully.")
 
     except Exception as e:
         logger.error(f"Error adjusting order times: {str(e)}")
         raise
+
 def transform_to_wide_format(db_path: str) -> None:
     """Transform the data to wide format based on blood draw level."""
     try:
@@ -157,8 +174,9 @@ def transform_to_wide_format(db_path: str) -> None:
                    {case_statements},
                    COUNT(*) AS DrawCount
             FROM labosys
-            GROUP BY Patientnummer, VerzamelDatetime, Labnummer
+            GROUP BY Patientnummer, VerzamelDatum, VerzamelTijd
         """)
+        cursor.execute("DROP TABLE IF EXISTS labosys")
         
         conn.commit()
         conn.close()
@@ -262,6 +280,7 @@ def copy_and_clean_database(source_path: str, dest_path: str, sample_size: Optio
         # Now clean the new database
         clean_duplicate_tests(dest_path)
         clean_invalid_results(dest_path)
+        adjust_order_times(dest_path)
         transform_to_wide_format(dest_path)  # Transform to wide format after cleaning
         
     except Exception as e:
@@ -298,15 +317,44 @@ def main(source_path: str, sample_size: Optional[int] = None) -> None:
         # Copy and clean the database
         copy_and_clean_database(source_path, dest_path, sample_size)
         
-        # Adjust order times for tests within one minute
-        adjust_order_times(dest_path)
-        
         logger.info(f"Database cleanup completed successfully. Clean database saved to: {dest_path}")
         
     except Exception as e:
         logger.error(f"Database cleanup failed: {str(e)}")
         raise
 
+def process_all_databases() -> None:
+    """Process all databases in the data/raw directory."""
+    raw_dir = 'data/raw'
+    if not os.path.exists(raw_dir):
+        logger.error(f"Raw data directory not found: {raw_dir}")
+        return
+
+    db_files = [f for f in os.listdir(raw_dir) if f.endswith('.db')]
+    if not db_files:
+        logger.error("No .db files found in the raw data directory")
+        return
+
+    for db_file in db_files:
+        year = db_file.split('.')[0]
+        logger.info(f"Processing database for year {year}")
+        main(os.path.join(raw_dir, db_file))
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    main("data/raw/2019.db")
+    
+    parser = argparse.ArgumentParser(description='Clean and process laboratory databases')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--db', type=str, help='Year of the database to process (e.g., 2020)')
+    group.add_argument('--all', action='store_true', help='Process all available databases')
+    
+    args = parser.parse_args()
+    
+    if args.all:
+        process_all_databases()
+    else:
+        db_path = f"data/raw/{args.db}.db"
+        if not os.path.exists(db_path):
+            logger.error(f"Database file not found: {db_path}")
+        else:
+            main(db_path)

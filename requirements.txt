@@ -2,3 +2,6 @@ pandas
 sqlite3
 matplotlib
 seaborn
+dash
+dash-bootstrap-components
+plotly
