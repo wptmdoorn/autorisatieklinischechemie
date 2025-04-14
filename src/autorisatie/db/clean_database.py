@@ -2,6 +2,7 @@ import sqlite3
 import logging
 import os
 from typing import Optional
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -106,21 +107,23 @@ def adjust_order_times(db_path: str) -> None:
         cursor.execute("""
             UPDATE labosys
             SET VerzamelTijd = (
-                SELECT FirstTime
-                FROM temp_adjusted
-                WHERE labosys.Patientnummer = temp_adjusted.Patientnummer
-                  AND labosys.VerzamelDatum = temp_adjusted.VerzamelDatum
+                SELECT MIN(l2.VerzamelTijd)
+                FROM labosys l2 
+                WHERE l2.Patientnummer = labosys.Patientnummer
+                AND l2.VerzamelDatum = labosys.VerzamelDatum
             )
             WHERE EXISTS (
                 SELECT 1
-                FROM temp_adjusted
-                WHERE labosys.Patientnummer = temp_adjusted.Patientnummer
-                  AND labosys.VerzamelDatum = temp_adjusted.VerzamelDatum
+                FROM labosys l3
+                WHERE l3.Patientnummer = labosys.Patientnummer
+                AND l3.VerzamelDatum = labosys.VerzamelDatum
+                GROUP BY l3.Patientnummer, l3.VerzamelDatum
+                HAVING COUNT(*) > 1
             )
         """)
 
-        # Cleanup
-        cursor.execute("DROP TABLE temp_adjusted")
+        # Drop the index we created
+        cursor.execute("DROP INDEX IF EXISTS idx_patient_date")
         
         conn.commit()
         conn.close()
@@ -129,7 +132,6 @@ def adjust_order_times(db_path: str) -> None:
     except Exception as e:
         logger.error(f"Error adjusting order times: {str(e)}")
         raise
-
 def transform_to_wide_format(db_path: str) -> None:
     """Transform the data to wide format based on blood draw level."""
     try:
@@ -175,80 +177,84 @@ def copy_and_clean_database(source_path: str, dest_path: str, sample_size: Optio
         dest_path: Path to the destination SQLite database
         sample_size: Optional number of records to sample (if None, copies all records)
     """
+
+    # get relevant tests from config/tests.json
+
+    test_config = json.load(open('config/tests.json'))
+    relevant_tests = [t for (t, tinfo) in test_config.items() if tinfo['include']]
+
     try:
         # Create new database and copy schema
         source_conn = connect_db(source_path)
         dest_conn = connect_db(dest_path, create_new=True)
         
-        if sample_size is None:
-            # Copy the entire database
-            source_conn.backup(dest_conn)
-        else:
-            # Copy schema by creating empty tables
-            cursor = source_conn.cursor()
-            cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='labosys'")
-            create_table_sql = cursor.fetchone()[0]
+        cursor = source_conn.cursor()
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='labosys'")
+        create_table_sql = cursor.fetchone()[0]
             
-            # Modify the create table SQL to include VerzamelDatetime
-            create_table_sql = create_table_sql.replace(")", ", VerzamelDatetime TEXT)")
-            dest_conn.execute(create_table_sql)
+        # Modify the create table SQL to include VerzamelDatetime
+        create_table_sql = create_table_sql.replace(")", ", VerzamelDatetime TEXT)")
+        dest_conn.execute(create_table_sql)
             
-            # Copy a random sample of records
-            cursor.execute("SELECT COUNT(*) FROM labosys")
-            total_records = cursor.fetchone()[0]
+        # Copy a random sample of records
+        cursor.execute("SELECT COUNT(*) FROM labosys")
+        total_records = cursor.fetchone()[0]
+
+        sample_size = sample_size if sample_size is not None else total_records 
             
-            logger.info(f"Sampling {sample_size} records from {total_records} total records")
+        logger.info(f"Sampling {sample_size} records from {total_records} total records")
             
-            # First, get the column names
-            cursor.execute("PRAGMA table_info(labosys)")
-            columns = [col[1] for col in cursor.fetchall()]
-            columns_str = ", ".join(columns)
+        # First, get the column names
+        cursor.execute("PRAGMA table_info(labosys)")
+        columns = [col[1] for col in cursor.fetchall()]
+        columns_str = ", ".join(columns)
             
-            # Use ORDER BY RANDOM() to get a truly random sample
-            source_cursor = source_conn.cursor()
-            dest_cursor = dest_conn.cursor()
-            
-            source_cursor.execute(f"""
+        source_cursor = source_conn.cursor()
+        dest_cursor = dest_conn.cursor()
+
+        # only include relevant_tests
+        source_cursor.execute(f"""
                 SELECT {columns_str} 
                 FROM labosys 
+                WHERE Testcode IN ({','.join(['?']*len(relevant_tests))})
                 LIMIT ?
-            """, (sample_size,))
+        """, (*relevant_tests, sample_size))
             
-            # Fetch and insert in batches to handle large samples
-            batch_size = 10000
-            while True:
-                rows = source_cursor.fetchmany(batch_size)
-                if not rows:
-                    break
+         # Fetch and insert in batches to handle large samples
+        batch_size = 10000
+        while True:
+            rows = source_cursor.fetchmany(batch_size)
+            if not rows:
+                break
                 
-                # Process rows to remove unwanted columns and merge date and time
-                processed_rows = []
-                for row in rows:
-                    # Create a new row without Prioriteit, Categorie, UniekLabnummer, and test
-                    new_row = [row[i] for i in range(len(row)) if columns[i] not in ['Prioriteit', 'Categorie', 'UniekLabnummer', 'test']]
+            # Process rows to remove unwanted columns and merge date and time
+            processed_rows = []
+            for row in rows:
+                # Create a new row without Prioriteit, Categorie, UniekLabnummer, and test
+                new_row = [row[i] for i in range(len(row)) if columns[i] not in ['Prioriteit', 'Categorie', 'UniekLabnummer', 'test']]
                     
-                    # Merge VerzamelDatum and VerzamelTijd into VerzamelDatetime
-                    verzamel_datum = row[columns.index('VerzamelDatum')]
-                    verzamel_tijd = row[columns.index('VerzamelTijd')]
+                # Merge VerzamelDatum and VerzamelTijd into VerzamelDatetime
+                verzamel_datum = row[columns.index('VerzamelDatum')]
+                verzamel_tijd = row[columns.index('VerzamelTijd')]
                     
-                    # Format VerzamelDatetime to %Y-%m-%d %H:%M:%S
-                    verzamel_datetime = f"{verzamel_datum[:4]}-{verzamel_datum[4:6]}-{verzamel_datum[6:]} {verzamel_tijd}:00"
+                # Format VerzamelDatetime to %Y-%m-%d %H:%M:%S
+                verzamel_datetime = f"{verzamel_datum[:4]}-{verzamel_datum[4:6]}-{verzamel_datum[6:]} {verzamel_tijd}:00"
                     
-                    # Append the new VerzamelDatetime to the new row
-                    new_row.append(verzamel_datetime)
-                    processed_rows.append(new_row)
+                # Append the new VerzamelDatetime to the new row
+                new_row.append(verzamel_datetime)
+                processed_rows.append(new_row)
                 
-                # Insert processed rows into the destination database
-                dest_cursor.executemany(
-                    f"INSERT INTO labosys ({','.join([col for col in columns if col not in ['Prioriteit', 'Categorie', 'UniekLabnummer', 'test']])}, VerzamelDatetime) VALUES ({','.join(['?' for _ in range(len(columns) - 4 + 1)])})",
-                    processed_rows
-                )
-                dest_conn.commit()
+            # Insert processed rows into the destination database
+            dest_cursor.executemany(
+                f"INSERT INTO labosys ({','.join([col for col in columns if col not in ['Prioriteit', 'Categorie', 'UniekLabnummer', 'test']])}, VerzamelDatetime) VALUES ({','.join(['?' for _ in range(len(columns) - 4 + 1)])})",
+                processed_rows
+            )
+            dest_conn.commit()
             
-            # Log the actual number of records copied
-            dest_cursor.execute("SELECT COUNT(*) FROM labosys")
-            actual_copied = dest_cursor.fetchone()[0]
-            logger.info(f"Actually copied {actual_copied} records")
+        # Log the actual number of records copied
+        dest_cursor.execute("SELECT COUNT(*) FROM labosys")
+        actual_copied = dest_cursor.fetchone()[0]
+        logger.info(f"Actually copied {actual_copied} records")
             
         source_conn.close()
         dest_conn.close()
@@ -303,4 +309,4 @@ def main(source_path: str, sample_size: Optional[int] = None) -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    main("data/raw/2013.db", sample_size=500000)
+    main("data/raw/2019.db")

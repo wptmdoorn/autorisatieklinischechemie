@@ -5,6 +5,10 @@ def check_schema(db_path: str):
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+
+        # print all table names
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        print(cursor.fetchall())
         
         cursor.execute("PRAGMA table_info(labosys)")
         columns = cursor.fetchall()
@@ -18,5 +22,5 @@ def check_schema(db_path: str):
         print(f"Error checking schema: {str(e)}")
 
 if __name__ == "__main__":
-    db_path = "data/raw/2013.db"  # Update with your actual database path
+    db_path = "data/raw/2023.db"  # Update with your actual database path
     check_schema(db_path)

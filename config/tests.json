@@ -1,0 +1,121 @@
+{
+    "KRESE" : {
+        "name": "Creatinin",
+        "test": "KRE",
+        "material": "serum",
+        "include": true,
+        "unit": "umol/L"
+    },
+
+    "KALSE": {
+        "name": "Kalium",
+        "test": "KAL",
+        "material": "serum",
+        "include": true,
+        "unit": "mmol/L"
+    },
+
+    "NATSE": {
+        "name": "Natrium",
+        "test": "NAT",
+        "material": "serum",
+        "include": true,
+        "unit": "mmol/L"
+    },
+
+    "CHOSE": {
+        "name": "Cholesterol",
+        "test": "CHOL",
+        "material": "serum",
+        "include": true,
+        "unit": "mmol/L"
+    },
+
+    "TRISE": {
+        "name": "Triglycerides",
+        "test": "TRI",
+        "material": "serum",
+        "include": true,
+        "unit": "mmol/L"
+    },
+
+    "ALTSE": {
+        "name": "ALAT",
+        "test": "ALAT",
+        "material": "serum",
+        "include": true,
+        "unit": "U/L"
+    },
+
+    "ASTSE": {
+        "name": "ASAT",
+        "test": "ASAT",
+        "material": "serum",
+        "include": true,
+        "unit": "U/L"
+    },
+
+    "GGTSE": {
+        "name": "GAMMA-GT",
+        "test": "GGT",
+        "material": "serum",
+        "include": true,
+        "unit": "U/L"
+    },
+
+    "AFSE": {
+        "name": "Alkaline phosphatase",
+        "test": "AF",
+        "material": "serum",
+        "include": true,
+        "unit": "U/L"
+    },
+
+    "ALBSE": {
+        "name": "Albumin",
+        "test": "ALB",
+        "material": "serum",
+        "include": true,
+        "unit": "g/L"
+    },
+
+    "CHOSE": {
+        "name": "Cholesterol",
+        "test": "CHOL",
+        "material": "serum",
+        "include": true,
+        "unit": "mmol/L"
+    },
+
+    "HB": {
+        "name": "Hemoglobin",
+        "test": "HB",
+        "material": "edtawholeblood",
+        "include": true,
+        "unit": "mmol/LL"
+    },
+
+    "LEUC": {
+        "name": "Leucocytes",
+        "test": "LEUC",
+        "material": "edtawholeblood",
+        "include": true,
+        "unit": "x 10^9/L"
+    },
+
+    "CRPSE": {
+        "name": "C-reactive protein",
+        "test": "CRP",
+        "material": "serum",
+        "include": true,
+        "unit": "mg/L"
+    },
+
+    "TRC": {
+        "name": "Platelets",
+        "test": "TRC",
+        "material": "edtawholeblood",
+        "include": true,
+        "unit": "x 10^9/L"
+    }
+}
