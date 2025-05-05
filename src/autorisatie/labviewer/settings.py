@@ -5,6 +5,10 @@ import os, sqlite3
 import pandas as pd
 import numpy as np
 import dash_bootstrap_components as dbc
+from .utils.config import load_test_config
+
+# Load test configuration
+lab_columns, test_display_names = load_test_config()
 
 # list all files in data clean and construct options for checklist
 try:
@@ -117,10 +121,9 @@ def load_data(n_clicks, selected_files, test_mode):
             conn = connect_db(db_path)
             
             # Step 1: Retrieve data from wide_blood_draws with specific columns
-            query = """
+            query = f"""
             SELECT Patientnummer, DrawCount, Labnummer, 
-                   AFSE, ALTSE, CHOSE, GGTSE, HB, KALSE, KRESE, LEUC, 
-                   NATSE, TRISE, ALBSE, ASTSE, CRPSE, TRC
+                   {', '.join(lab_columns)}
             FROM wide_blood_draws
             """
             
@@ -139,12 +142,10 @@ def load_data(n_clicks, selected_files, test_mode):
         combined_df = pd.concat(all_dfs, ignore_index=True)
         
         # Convert to numeric, handling errors
-        numeric_columns = ['AFSE', 'ALTSE', 'CHOSE', 'GGTSE', 'HB', 'KALSE', 'KRESE', 'LEUC', 
-                          'NATSE', 'TRISE', 'ALBSE', 'ASTSE', 'CRPSE', 'TRC']
-        combined_df[numeric_columns] = combined_df[numeric_columns].apply(pd.to_numeric, errors='coerce')
+        combined_df[lab_columns] = combined_df[lab_columns].apply(pd.to_numeric, errors='coerce')
 
         # Optimize memory usage
-        for col in numeric_columns:
+        for col in lab_columns:
             combined_df[col] = pd.to_numeric(combined_df[col], downcast='float')
         
         records = combined_df.to_dict('records')

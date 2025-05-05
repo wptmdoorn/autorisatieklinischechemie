@@ -6,6 +6,10 @@ import plotly.express as px
 import pandas as pd
 import plotly
 import dash_bootstrap_components as dbc
+from .utils.config import load_test_config
+
+# Load test configuration
+lab_columns, test_display_names = load_test_config()
 
 plotly.io.json.config.default_engine = 'orjson'
 
@@ -31,7 +35,7 @@ def hist(data, test_str):
     
     # Optimize the layout
     fig.update_layout(
-        title=f"Distribution of {test_str}",
+        title=f"Distribution of {test_display_names[test_str]}",
         showlegend=False,  # Disable legend if not needed
         margin=dict(l=40, r=40, t=60, b=40),  # Optimize margins
         plot_bgcolor='white'
@@ -49,9 +53,10 @@ def dropdown_check(data):
         return no_update
     
     df = pd.DataFrame(data)
-    # Only include numeric columns
-    numeric_cols = df.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns
-    return sorted(list(numeric_cols))
+    # Only include numeric columns that are in our lab_columns
+    numeric_cols = [col for col in df.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns 
+                   if col in lab_columns]
+    return [{'label': test_display_names[col], 'value': col} for col in sorted(numeric_cols)]
 
 def page():
     return dbc.Container([

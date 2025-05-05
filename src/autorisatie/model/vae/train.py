@@ -1,220 +1,205 @@
-import numpy as np
-import pandas as pd
-import sqlite3
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
 import pickle
+import os
+from pathlib import Path
+from tqdm import tqdm
+import sqlite3
+from .model import VAE
 
-# Stap 1: Laad en voorbewerk de data
-conn = sqlite3.connect("data/clean/2020.db")
-conn.text_factory = lambda x: x.decode(errors='ignore')
-query = conn.execute("SELECT * FROM wide_blood_draws")
-cols = [column[0] for column in query.description]
-df = pd.DataFrame.from_records(data=query.fetchall(), columns=cols)
-conn.close()
+# Training parameters
+TRAINING_PARAMS = {
+    'batch_size': 512,
+    'learning_rate': 0.001,
+    'num_epochs': 10,
+    'patience': 10,  # Early stopping patience
+    'min_delta': 0.0001,  # Minimum improvement for early stopping
+    'encoding_dim': 10,  # Latent space dimension
+    'input_dim': 14,  # Number of lab tests
+    'beta': 0.1  # Weight for KL divergence term
+}
 
-# Selecteer alleen labwaarden
-lab_columns = ['AFSE', 'ALTSE', 'CHOSE', 'GGTSE', 'HB', 'KALSE', 'KRESE', 'LEUC', 'NATSE', 'TRISE', 
-               'ALBSE', 'ASTSE', 'CRPSE', 'TRC']
-data = df[lab_columns]
+# Lab test columns
+LAB_COLUMNS = [
+    'AFSE', 'ALTSE', 'CHOSE', 'GGTSE', 'HB', 'KALSE', 'KRESE', 'LEUC',
+    'NATSE', 'TRISE', 'ALBSE', 'ASTSE', 'CRPSE', 'TRC'
+]
 
-# Vervang tekst en NaN door -1
-data = data.apply(pd.to_numeric, errors='coerce').fillna(-1)
+def prepare_data(data_path, test_mode=False):
+    """Prepare data for training."""
+    # Load data
+    conn = sqlite3.connect(data_path)
+    conn.text_factory = lambda x: x.decode(errors='ignore')
+    query = conn.execute("SELECT * FROM wide_blood_draws")
+    cols = [column[0] for column in query.description]
+    df = pd.DataFrame.from_records(data=query.fetchall(), columns=cols)
+    conn.close()
 
-# Stap 2: Normaliseer de data
-n_features = len(lab_columns)
-data_normalized = data.values.copy()
-scaler = StandardScaler()
+    # Select lab values
+    data = df[LAB_COLUMNS]
+    data = data.apply(pd.to_numeric, errors='coerce').fillna(-1)
 
-for i in range(n_features):
-    mask_col = data_normalized[:, i] != -1
-    if np.sum(mask_col) > 1:
-        data_normalized[mask_col, i] = scaler.fit_transform(
-            data_normalized[mask_col, i].reshape(-1, 1)
-        ).flatten()
+    # Normalize data
+    data_normalized = data.values.copy()
+    scaler = StandardScaler()
 
-# Sla de scaler op
-with open('out/model/vae_scaler.pkl', 'wb') as f:
-    pickle.dump(scaler, f)
-print("Scaler opgeslagen als 'scaler.pkl'")
+    for i in range(len(LAB_COLUMNS)):
+        mask_col = data_normalized[:, i] != -1
+        if np.sum(mask_col) > 1:
+            data_normalized[mask_col, i] = scaler.fit_transform(
+                data_normalized[mask_col, i].reshape(-1, 1)
+            ).flatten()
 
-# Check op volledig gemaskeerde samples
-valid_samples = np.any(data_normalized != -1, axis=1)
-if not np.all(valid_samples):
-    print(f"Waarschuwing: {np.sum(~valid_samples)} samples hebben alleen -1 waarden")
-    data_normalized = data_normalized[valid_samples]
+    # Save scaler
+    os.makedirs('../out/model', exist_ok=True)
+    with open('../out/model/vae_scaler.pkl', 'wb') as f:
+        pickle.dump(scaler, f)
 
-# Zet data om naar PyTorch tensor
-data_tensor = torch.tensor(data_normalized, dtype=torch.float32)
-dataset = TensorDataset(data_tensor, data_tensor)
-dataloader = DataLoader(dataset, batch_size=128, shuffle=True)
-
-# Stap 3: Definieer de VAE
-class VAE(nn.Module):
-    def __init__(self, input_dim, encoding_dim):
-        super(VAE, self).__init__()
-        # Encoder
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, encoding_dim * 2)
-        )
-        # Decoder
-        self.decoder = nn.Sequential(
-            nn.Linear(encoding_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 64),
-            nn.ReLU(),
-            nn.Linear(64, input_dim)
-        )
-        # Log-variances voor reconstructie
-        self.logvar_decoder = nn.Sequential(
-            nn.Linear(encoding_dim, input_dim)
-        )
-        self.input_dim = input_dim
-        self.encoding_dim = encoding_dim
+    # Convert to PyTorch tensor
+    data_tensor = torch.tensor(data_normalized, dtype=torch.float32)
+    dataset = TensorDataset(data_tensor, data_tensor)
     
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+    if test_mode:
+        # Use a smaller subset for testing
+        dataset = torch.utils.data.Subset(dataset, range(1000))
     
-    def forward(self, x):
-        h = self.encoder(x)
-        mu, logvar = h.chunk(2, dim=-1)
-        z = self.reparameterize(mu, logvar)
-        recon = self.decoder(z)
-        recon_logvar = self.logvar_decoder(z)
-        return recon, mu, logvar, recon_logvar
+    dataloader = DataLoader(dataset, batch_size=TRAINING_PARAMS['batch_size'], shuffle=True)
+    return dataloader, scaler
 
-# Stap 4: Definieer de VAE loss-functie
-def vae_loss(recon, x, mu, logvar, recon_logvar, mask):
-    # Zorg dat log(2π) een tensor is
-    log_2pi = torch.tensor(np.log(2 * np.pi), device=x.device, dtype=x.dtype)
+def vae_loss(recon_x, x, mu, log_var, mask):
+    """Calculate VAE loss (reconstruction + KL divergence)."""
+    # Reconstruction loss
+    recon_loss = ((recon_x - x) ** 2 * mask).sum(dim=1) / torch.clamp(mask.sum(dim=1), min=1e-10)
     
-    # Reconstructieloss (Gaussische log-waarschijnlijkheid)
-    recon_loss = 0.5 * (log_2pi + recon_logvar + 
-                        ((x - recon) ** 2 / torch.exp(recon_logvar))) * mask
+    # KL divergence
+    kl_div = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
     
-    # Controleer op nan/inf in recon_loss
-    if torch.isnan(recon_loss).any() or torch.isinf(recon_loss).any():
-        print("Waarschuwing: nan/inf gedetecteerd in recon_loss")
-        recon_loss = torch.where(
-            torch.isnan(recon_loss) | torch.isinf(recon_loss),
-            torch.zeros_like(recon_loss),
-            recon_loss
-        )
+    # Combine losses
+    total_loss = recon_loss + TRAINING_PARAMS['beta'] * kl_div
     
-    recon_loss = recon_loss.sum() / torch.clamp(mask.sum(), min=1e-10)
-    
-    # KL-divergentie
-    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
-    kl_loss = kl_loss.mean()
-    
-    return recon_loss + kl_loss
+    return total_loss.mean(), recon_loss.mean(), kl_div.mean()
 
-# Stap 5: Instantieer en train het model
-input_dim = n_features
-encoding_dim = 5
-model = VAE(input_dim, encoding_dim)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model.to(device)
-
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-num_epochs = 50
-
-for epoch in range(num_epochs):
-    total_loss = 0
-    for batch in dataloader:
-        inputs, _ = batch
-        inputs = inputs.to(device)
+def train_model(data_path, test_mode=False):
+    """Train the VAE model with early stopping."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Prepare data
+    dataloader, scaler = prepare_data(data_path, test_mode)
+    
+    # Initialize model
+    model = VAE(
+        input_dim=TRAINING_PARAMS['input_dim'],
+        encoding_dim=TRAINING_PARAMS['encoding_dim']
+    ).to(device)
+    
+    # Optimizer
+    optimizer = optim.Adam(model.parameters(), lr=TRAINING_PARAMS['learning_rate'])
+    
+    # Training loop with early stopping
+    best_loss = float('inf')
+    patience_counter = 0
+    train_losses = []
+    
+    for epoch in range(TRAINING_PARAMS['num_epochs']):
+        model.train()
+        total_loss = 0
+        total_recon_loss = 0
+        total_kl_loss = 0
         
-        recon, mu, logvar, recon_logvar = model(inputs)
-        mask = (inputs != -1).float()
-        loss = vae_loss(recon, inputs, mu, logvar, recon_logvar, mask)
+        for batch in tqdm(dataloader, desc=f'Epoch {epoch+1}/{TRAINING_PARAMS["num_epochs"]}'):
+            inputs, targets = batch
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            # Forward pass
+            recon_batch, mu, log_var = model(inputs)
+            mask = (inputs != -1).float()
+            
+            # Calculate loss
+            loss, recon_loss, kl_loss = vae_loss(recon_batch, targets, mu, log_var, mask)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            total_recon_loss += recon_loss.item()
+            total_kl_loss += kl_loss.item()
         
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        avg_loss = total_loss / len(dataloader)
+        avg_recon_loss = total_recon_loss / len(dataloader)
+        avg_kl_loss = total_kl_loss / len(dataloader)
+        train_losses.append(avg_loss)
         
-        total_loss += loss.item()
+        # Early stopping check
+        if avg_loss < best_loss - TRAINING_PARAMS['min_delta']:
+            print('improvement')
+            best_loss = avg_loss
+            patience_counter = 0
+            # Save best model
+            torch.save(model.state_dict(), '../out/model/vae_lab_model.pth')
+        else:
+            patience_counter += 1
+            if patience_counter >= TRAINING_PARAMS['patience']:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
+        
+        print(f'Epoch [{epoch+1}/{TRAINING_PARAMS["num_epochs"]}], '
+              f'Total Loss: {avg_loss:.4f}, '
+              f'Recon Loss: {avg_recon_loss:.4f}, '
+              f'KL Loss: {avg_kl_loss:.4f}')
     
-    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(dataloader):.4f}')
-
-# Stap 6: Sla het model op
-torch.save(model.state_dict(), 'out/model/vae_lab_model.pth')
-print("Model opgeslagen als 'vae_lab_model.pth'")
-
-# Stap 7: Functie voor waarschijnlijkheidsscore per labtest
-def get_probability_score_per_test(data_new, model, scaler, device):
-    """
-    Bereken de waarschijnlijkheidsscore per labtest voor nieuwe data.
-    """
-    # Normaliseer nieuwe data
-    data_new_normalized = data_new.copy()
-    for i in range(data_new.shape[1]):
-        mask_col = data_new[:, i] != -1
-        if np.sum(mask_col) > 0:
-            try:
-                data_new_normalized[mask_col, i] = scaler.transform(
-                    data_new[mask_col, i].reshape(-1, 1)
-                ).flatten()
-            except Exception as e:
-                print(f"Fout bij normaliseren kolom {i}: {e}")
-                data_new_normalized[mask_col, i] = 0
-    
-    # Debugging: print genormaliseerde waarde voor AFSE
-    print(f"Genormaliseerde AFSE (sample 0): {data_new_normalized[0, 0]:.4f}")
-    
-    # Check op volledig gemaskeerde samples
-    valid_samples = np.any(data_new_normalized != -1, axis=1)
-    if not np.all(valid_samples):
-        print(f"Waarschuwing: {np.sum(~valid_samples)} samples hebben alleen -1 waarden")
-    
-    # Zet om naar tensor
-    data_tensor = torch.tensor(data_new_normalized, dtype=torch.float32).to(device)
-    
-    # Voorspel reconstructie
+    # Calculate and save max MSE values
+    model.load_state_dict(torch.load('../out/model/vae_lab_model.pth'))
     model.eval()
+    
+    mse_values = []
+    mse_per_test_values = []
+    kl_values = []
+    
     with torch.no_grad():
-        recon, mu, logvar, recon_logvar = model(data_tensor)
+        for batch in dataloader:
+            inputs, _ = batch
+            inputs = inputs.to(device)
+            outputs, mu, log_var = model(inputs)
+            mask = (inputs != -1).float()
+            
+            # Calculate MSE
+            mse = ((outputs - inputs) ** 2 * mask).sum(dim=1) / torch.clamp(mask.sum(dim=1), min=1e-10)
+            mse_values.append(mse.cpu().numpy())
+            
+            # Calculate MSE per test
+            mse_per_test = ((outputs - inputs) ** 2 * mask).cpu().numpy()
+            mse_per_test_values.append(mse_per_test)
+            
+            # Calculate KL divergence
+            kl_div = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
+            kl_values.append(kl_div.cpu().numpy())
     
-    # Bereken log-waarschijnlijkheid per test
-    mask = (data_tensor != -1).float()
-    log_prob = -0.5 * (torch.log(2 * np.pi) + recon_logvar + 
-                       ((data_tensor - recon) ** 2 / torch.exp(recon_logvar))) * mask
+    mse_values = np.concatenate(mse_values)
+    max_mse = np.max(mse_values[np.isfinite(mse_values)]) if np.any(np.isfinite(mse_values)) else 1.0
     
-    # Converteer naar waarschijnlijkheidsscore
-    probability_scores = torch.exp(log_prob / torch.clamp(mask.sum(dim=1, keepdim=True), min=1e-10))
-    probability_scores = probability_scores.cpu().numpy()
-    probability_scores = np.where(mask.cpu().numpy() == 0, np.nan, probability_scores)
-    probability_scores = np.clip(probability_scores, 0, 1)
+    mse_per_test_values = np.concatenate(mse_per_test_values, axis=0)
+    max_mse_per_test = np.max(mse_per_test_values, axis=0, where=mse_per_test_values != 0, initial=1.0)
+    max_mse_per_test = np.where(max_mse_per_test == 0, 1.0, max_mse_per_test)
     
-    return probability_scores
+    # Save max MSE values
+    with open('../out/model/vae_max_mse.pkl', 'wb') as f:
+        pickle.dump(max_mse, f)
+    with open('../out/model/vae_max_mse_per_test.pkl', 'wb') as f:
+        pickle.dump(max_mse_per_test, f)
+    
+    return model, scaler, max_mse, max_mse_per_test
 
-# Stap 8: Inferentie-test
-# Laad scaler en model
-with open('out/model/vae_scaler.pkl', 'rb') as f:
-    scaler = pickle.load(f)
-model = VAE(input_dim=14, encoding_dim=5)
-model.load_state_dict(torch.load('out/model/vae_lab_model.pth'))
-model.to(device)
-model.eval()
-
-# Test met originele data
-test_data = data.values.copy()
-prob_scores = get_probability_score_per_test(test_data, model, scaler, device)
-print("Waarschijnlijkheidsscore voor AFSE (sample 0, origineel):", 
-      prob_scores[0, 0] if not np.isnan(prob_scores[0, 0]) else "ontbrekend")
-
-# Test met AFSE = 10.000
-test_data_abnormal = test_data.copy()
-test_data_abnormal[0, 0] = 10000
-prob_scores_abnormal = get_probability_score_per_test(test_data_abnormal, model, scaler, device)
-print("Waarschijnlijkheidsscore voor AFSE (sample 0, AFSE=10.000):", 
-      prob_scores_abnormal[0, 0] if not np.isnan(prob_scores_abnormal[0, 0]) else "ontbrekend")
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description='Train the VAE model')
+    parser.add_argument('--data', type=str, required=True, help='Path to the database file')
+    parser.add_argument('--test', action='store_true', help='Run in test mode with smaller dataset')
+    args = parser.parse_args()
+    
+    train_model(args.data, args.test) 

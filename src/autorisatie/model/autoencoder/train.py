@@ -9,18 +9,8 @@ import pickle
 import os
 from pathlib import Path
 from tqdm import tqdm
+import sqlite3
 from .model import Autoencoder
-
-# Training parameters
-TRAINING_PARAMS = {
-    'batch_size': 512,
-    'learning_rate': 0.001,
-    'num_epochs': 100,
-    'patience': 10,  # Early stopping patience
-    'min_delta': 0.0001,  # Minimum improvement for early stopping
-    'encoding_dim': 10,
-    'input_dim': 14,  # Number of lab tests
-}
 
 # Lab test columns
 LAB_COLUMNS = [
@@ -28,7 +18,7 @@ LAB_COLUMNS = [
     'NATSE', 'TRISE', 'ALBSE', 'ASTSE', 'CRPSE', 'TRC'
 ]
 
-def prepare_data(data_path, test_mode=False):
+def prepare_data(data_path, batch_size, test_mode=False):
     """Prepare data for training."""
     # Load data
     conn = sqlite3.connect(data_path)
@@ -54,8 +44,8 @@ def prepare_data(data_path, test_mode=False):
             ).flatten()
 
     # Save scaler
-    os.makedirs('out/model', exist_ok=True)
-    with open('out/model/autoencoder_scaler.pkl', 'wb') as f:
+    os.makedirs('../out/model', exist_ok=True)
+    with open('../out/model/autoencoder_scaler.pkl', 'wb') as f:
         pickle.dump(scaler, f)
 
     # Convert to PyTorch tensor
@@ -66,36 +56,89 @@ def prepare_data(data_path, test_mode=False):
         # Use a smaller subset for testing
         dataset = torch.utils.data.Subset(dataset, range(1000))
     
-    dataloader = DataLoader(dataset, batch_size=TRAINING_PARAMS['batch_size'], shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     return dataloader, scaler
 
+def create_model(params, input_dim):
+    """Create a model with the given hyperparameters."""
+    # Create encoder layers
+    encoder_layers = []
+    prev_dim = input_dim
+    for i in range(params['n_layers']):
+        hidden_dim = params[f'hidden_dim_{i}']
+        encoder_layers.extend([
+            nn.Linear(prev_dim, hidden_dim),
+            nn.ReLU()
+        ])
+        prev_dim = hidden_dim
+    encoder_layers.extend([
+        nn.Linear(prev_dim, params['encoding_dim']),
+        nn.ReLU()
+    ])
+    
+    # Create decoder layers
+    decoder_layers = []
+    prev_dim = params['encoding_dim']
+    for i in range(params['n_layers']-1, -1, -1):
+        hidden_dim = params[f'hidden_dim_{i}']
+        decoder_layers.extend([
+            nn.Linear(prev_dim, hidden_dim),
+            nn.ReLU()
+        ])
+        prev_dim = hidden_dim
+    decoder_layers.append(nn.Linear(prev_dim, input_dim))
+    
+    # Create model
+    model = Autoencoder(input_dim, params['encoding_dim'])
+    model.encoder = nn.Sequential(*encoder_layers)
+    model.decoder = nn.Sequential(*decoder_layers)
+    
+    return model
+
 def train_model(data_path, test_mode=False):
-    """Train the autoencoder model with early stopping."""
+    """Train the autoencoder model with optimized hyperparameters."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
+    # Load best hyperparameters
+    try:
+        with open('../out/model/autoencoder_best_params.pkl', 'rb') as f:
+            params = pickle.load(f)
+    except FileNotFoundError:
+        print("No optimized hyperparameters found. Using default values.")
+        params = {
+            'batch_size': 512,
+            'learning_rate': 0.001,
+            'num_epochs': 100,
+            'patience': 10,
+            'min_delta': 0.0001,
+            'encoding_dim': 10,
+            'n_layers': 3,
+            'hidden_dim_0': 128,
+            'hidden_dim_1': 64,
+            'hidden_dim_2': 32
+        }
+    
     # Prepare data
-    dataloader, scaler = prepare_data(data_path, test_mode)
+    dataloader, scaler = prepare_data(data_path, params['batch_size'], test_mode)
     
     # Initialize model
-    model = Autoencoder(
-        input_dim=TRAINING_PARAMS['input_dim'],
-        encoding_dim=TRAINING_PARAMS['encoding_dim']
-    ).to(device)
+    model = create_model(params, input_dim=len(LAB_COLUMNS))
+    model = model.to(device)
     
     # Loss and optimizer
     criterion = nn.MSELoss(reduction='none')
-    optimizer = optim.Adam(model.parameters(), lr=TRAINING_PARAMS['learning_rate'])
+    optimizer = optim.Adam(model.parameters(), lr=params['learning_rate'])
     
     # Training loop with early stopping
     best_loss = float('inf')
     patience_counter = 0
     train_losses = []
     
-    for epoch in range(TRAINING_PARAMS['num_epochs']):
+    for epoch in range(params['num_epochs']):
         model.train()
         total_loss = 0
         
-        for batch in tqdm(dataloader, desc=f'Epoch {epoch+1}/{TRAINING_PARAMS["num_epochs"]}'):
+        for batch in tqdm(dataloader, desc=f'Epoch {epoch+1}/{params["num_epochs"]}'):
             inputs, targets = batch
             inputs, targets = inputs.to(device), targets.to(device)
             
@@ -114,21 +157,21 @@ def train_model(data_path, test_mode=False):
         train_losses.append(avg_loss)
         
         # Early stopping check
-        if avg_loss < best_loss - TRAINING_PARAMS['min_delta']:
+        if avg_loss < best_loss - params['min_delta']:
             best_loss = avg_loss
             patience_counter = 0
             # Save best model
-            torch.save(model.state_dict(), 'out/model/autoencoder_lab_model.pth')
+            torch.save(model.state_dict(), '../out/model/autoencoder_lab_model.pth')
         else:
             patience_counter += 1
-            if patience_counter >= TRAINING_PARAMS['patience']:
+            if patience_counter >= params['patience']:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
         
-        print(f'Epoch [{epoch+1}/{TRAINING_PARAMS["num_epochs"]}], Loss: {avg_loss:.4f}')
+        print(f'Epoch [{epoch+1}/{params["num_epochs"]}], Loss: {avg_loss:.4f}')
     
     # Calculate and save max MSE values
-    model.load_state_dict(torch.load('out/model/autoencoder_lab_model.pth'))
+    model.load_state_dict(torch.load('../out/model/autoencoder_lab_model.pth'))
     model.eval()
     
     mse_values = []
@@ -157,9 +200,9 @@ def train_model(data_path, test_mode=False):
     max_mse_per_test = np.where(max_mse_per_test == 0, 1.0, max_mse_per_test)
     
     # Save max MSE values
-    with open('out/model/autoencoder_max_mse.pkl', 'wb') as f:
+    with open('../out/model/autoencoder_max_mse.pkl', 'wb') as f:
         pickle.dump(max_mse, f)
-    with open('out/model/autoencoder_max_mse_per_test.pkl', 'wb') as f:
+    with open('../out/model/autoencoder_max_mse_per_test.pkl', 'wb') as f:
         pickle.dump(max_mse_per_test, f)
     
     return model, scaler, max_mse, max_mse_per_test

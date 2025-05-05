@@ -9,71 +9,50 @@ import json
 import torch
 from sklearn.preprocessing import StandardScaler
 import os
-from ..model.autoencoder.model import get_pseudo_probability_score_per_test, Autoencoder, get_feasibility_score
+from ..model.autoencoder.inference import AutoencoderPredictor
+from ..model.correlation.inference import CorrelationPredictor
+from ..model.vae.inference import VAEPredictor
 import pickle
+from .utils.config import load_test_config
+
+# Load test configuration
+lab_columns, test_display_names = load_test_config()
 
 # Cache the model and scaler loading
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 models = {}
+
+# Dictionary mapping model names to their predictor classes
+model_dict = {
+    'Autoencoder': AutoencoderPredictor,
+    'Correlation': CorrelationPredictor,
+    'VAE': VAEPredictor
+}
+
 scalers = {}
 
 def load_models():
     """Load all available models and their scalers"""
     global models, scalers
     
-    # Autoencoder model 1
-    if 'autoencoder1' not in models:
-        try:
-            model = Autoencoder(input_dim=14, encoding_dim=10)
-            model_path = os.path.join('..', 'out', 'model', 'autoencoder_lab_model.pth')
-            if os.path.exists(model_path):
-                model.load_state_dict(torch.load(model_path, map_location=device))
-                model.to(device)
-                model.eval()
-                models['autoencoder1'] = model
-                print("Successfully loaded autoencoder model 1")
-            else:
-                print("Warning: Autoencoder model 1 file not found at", model_path)
-        except Exception as e:
-            print(f"Error loading autoencoder model 1: {str(e)}")
+    # Initialize models dictionary
+    models = {}
     
-    if 'autoencoder1' not in scalers:
+    # Load each model type
+    for model_name, predictor_class in model_dict.items():
         try:
-            with open('../out/model/autoencoder_scaler.pkl', 'rb') as f:
-                scalers['autoencoder1'] = pickle.load(f)
+            # Initialize predictor
+            predictor = predictor_class()
+            models[model_name] = predictor
+            print(f"Successfully loaded {model_name} model")
         except Exception as e:
-            print(f"Error loading autoencoder scaler 1: {str(e)}")
+            print(f"Error loading {model_name} model: {str(e)}")
     
-    # Autoencoder model 2 (placeholder)
-    if 'autoencoder2' not in models:
-        try:
-            model = Autoencoder(input_dim=14, encoding_dim=10)
-            model_path = os.path.join('..', 'out', 'model', 'autoencoder_lab_model.pth')
-            if os.path.exists(model_path):
-                model.load_state_dict(torch.load(model_path, map_location=device))
-                model.to(device)
-                model.eval()
-                models['autoencoder2'] = model
-                print("Successfully loaded autoencoder model 2")
-            else:
-                print("Warning: Autoencoder model 2 file not found at", model_path)
-        except Exception as e:
-            print(f"Error loading autoencoder model 2: {str(e)}")
-    
-    if 'autoencoder2' not in scalers:
-        try:
-            with open('../out/model/autoencoder_scaler.pkl', 'rb') as f:
-                scalers['autoencoder2'] = pickle.load(f)
-        except Exception as e:
-            print(f"Error loading autoencoder scaler 2: {str(e)}")
-    
-    return models, scalers
+    return models
 
 # Load models at startup
-models, scalers = load_models()
+models = load_models()
 
-lab_columns = ['AFSE', 'ALTSE', 'CHOSE', 'GGTSE', 'HB', 'KALSE', 'KRESE', 'LEUC', 'NATSE', 'TRISE', 
-               'ALBSE', 'ASTSE', 'CRPSE', 'TRC']
 metadata_fields = ['Patientnummer', 'DrawCount', 'Labnummer']
 
 # Prevent callback retriggers for unchanged data
@@ -135,7 +114,7 @@ def update_order(next_clicks, prev_clicks, data, current_idx):
     input_fields = [
         dbc.Row([
             dbc.Col(
-                html.Label(col, className="fw-bold"),
+                html.Label(test_display_names[col], className="fw-bold"),
                 width=3
             ),
             dbc.Col(
@@ -192,12 +171,16 @@ def calculate_feasibility(values, selected_models, ids):
     # Calculate probabilities for each selected model
     model_scores = {}
     for model_name in selected_models:
-        if model_name in models and model_name in scalers:
-            with torch.no_grad():
-                prob_scores, _ = get_pseudo_probability_score_per_test(
-                    data, models[model_name], scalers[model_name], device
-                )
-                model_scores[model_name] = prob_scores[0]
+        if model_name in models:
+            try:
+                results = models[model_name].predict(data)
+                model_scores[model_name] = {
+                    'test_scores': results['test_scores'][0],
+                    'total_score': results['total_score'][0]
+                }
+            except Exception as e:
+                print(f"Error making prediction with {model_name}: {str(e)}")
+                continue
     
     # Create probability displays for each test
     prob_displays = []
@@ -207,30 +190,25 @@ def calculate_feasibility(values, selected_models, ids):
             idx = lab_columns.index(col)
             model_badges = []
             for model_name, scores in model_scores.items():
-                prob = scores[idx]
+                prob = scores['test_scores'][idx]
                 if np.isnan(prob):
-                    model_badges.append(dbc.Badge(f"{model_name[-1]}: N/A", color="secondary", className="ms-1"))
+                    model_badges.append(dbc.Badge(f"{model_name}: N/A", color="secondary", className="ms-1"))
                 else:
                     color = "success" if prob >= 0.7 else "warning" if prob >= 0.4 else "danger"
-                    model_badges.append(dbc.Badge(f"{model_name[-1]}: {prob*100:.1f}%", color=color, className="ms-1"))
+                    model_badges.append(dbc.Badge(f"{model_name}: {prob*100:.1f}%", color=color, className="ms-1"))
             prob_displays.append(html.Div(model_badges))
         else:
             prob_displays.append(html.Span(""))
-    
-    # Calculate overall feasibility scores
-    feasibility_scores = {}
-    for model_name, scores in model_scores.items():
-        overall_score = get_feasibility_score(data, models[model_name], scalers[model_name], device)[0][0] * 100
-        feasibility_scores[model_name] = overall_score
     
     # Create feasibility display
     feasibility_display = [
         html.H4("Feasibility Analysis", className="text-center mb-3"),
         html.Div([
             html.Div([
-                html.H5(f"Model {model_name[-1]}", className="text-center mb-2"),
-                html.H1(f"{score:.1f}%", className="text-center display-4 mb-3"),
-            ], className="mb-4") for model_name, score in feasibility_scores.items()
+                html.H5(f"{model_name}", className="text-center mb-2"),
+                html.H1(f"{scores['total_score']*100:.1f}%" if not np.isnan(scores['total_score']) else "N/A", 
+                       className="text-center display-4 mb-3"),
+            ], className="mb-4") for model_name, scores in model_scores.items()
         ]),
         html.Div([
             html.P("Probability Legend:", className="mb-2"),
@@ -267,10 +245,10 @@ def page():
                                 dbc.Checklist(
                                     id='model-checklist',
                                     options=[
-                                        {'label': 'Autoencoder Model 1', 'value': 'autoencoder1'},
-                                        {'label': 'Autoencoder Model 2', 'value': 'autoencoder2'}
+                                        {'label': model_name, 'value': model_name}
+                                        for model_name in model_dict.keys()
                                     ],
-                                    value=['autoencoder1'],  # Default to first model
+                                    value=list(model_dict.keys())[:1],  # Default to first model
                                     inline=True,
                                     className="mb-3"
                                 ),

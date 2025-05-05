@@ -9,6 +9,10 @@ from scipy.stats import linregress
 from scipy.optimize import curve_fit
 import dash_bootstrap_components as dbc
 import numpy as np
+from .utils.config import load_test_config
+
+# Load test configuration
+lab_columns, test_display_names = load_test_config()
 
 plotly.io.json.config.default_engine = 'orjson'
 
@@ -53,9 +57,9 @@ def correlation_plot(data, x_var, y_var):
                  f"{line_eq}")
 
     fig.update_layout(
-        title=f"Correlation between {x_var} and {y_var}",
-        xaxis_title=x_var,
-        yaxis_title=y_var,
+        title=f"Correlation between {test_display_names[x_var]} and {test_display_names[y_var]}",
+        xaxis_title=test_display_names[x_var],
+        yaxis_title=test_display_names[y_var],
         plot_bgcolor='white',
         annotations=[
             dict(
@@ -87,8 +91,9 @@ def update_correlation_matrix(data):
     
     df = pd.DataFrame(data)
     
-    # Get numeric columns
-    numeric_cols = df.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns
+    # Get numeric columns that are in our lab_columns
+    numeric_cols = [col for col in df.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns 
+                   if col in lab_columns]
     df_numeric = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
     
     # Calculate correlation matrix
@@ -100,8 +105,8 @@ def update_correlation_matrix(data):
     # Add heatmap
     fig.add_trace(go.Heatmap(
         z=corr_matrix.values,
-        x=corr_matrix.columns,
-        y=corr_matrix.columns,
+        x=[test_display_names[col] for col in corr_matrix.columns],
+        y=[test_display_names[col] for col in corr_matrix.columns],
         zmin=-1,
         zmax=1,
         colorscale='RdBu',
@@ -134,10 +139,14 @@ def update_dropdowns(data):
     if data is None:
         return no_update, no_update
     df = pd.DataFrame(data)
-    # Only include numeric columns
-    numeric_cols = df.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns
-    options = sorted(list(numeric_cols))
+    # Only include numeric columns that are in our lab_columns
+    numeric_cols = [col for col in df.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns 
+                   if col in lab_columns]
+    options = [{'label': test_display_names[col], 'value': col} for col in sorted(numeric_cols)]
     return options, options
+
+# Create reverse mapping from display names to test IDs
+display_to_test = {display: test for test, display in test_display_names.items()}
 
 # New callback to handle matrix clicks
 @dash.callback(
@@ -152,8 +161,12 @@ def handle_matrix_click(clickData):
         return no_update, no_update, no_update
     
     # Extract x and y variables from the click data
-    x_var = clickData['points'][0]['x']
-    y_var = clickData['points'][0]['y']
+    x_display = clickData['points'][0]['x']
+    y_display = clickData['points'][0]['y']
+    
+    # Map display names back to test IDs
+    x_var = display_to_test[x_display]
+    y_var = display_to_test[y_display]
     
     # Don't update if clicked on same variable (diagonal)
     if x_var == y_var:
@@ -326,9 +339,9 @@ def update_model_comparison(data, x_var, y_var):
             print(f"Error plotting {model_name}: {str(e)}")
     
     fig.update_layout(
-        title=f"Model Comparison for {x_var} vs {y_var}",
-        xaxis_title=x_var,
-        yaxis_title=y_var,
+        title=f"Model Comparison for {test_display_names[x_var]} vs {test_display_names[y_var]}",
+        xaxis_title=test_display_names[x_var],
+        yaxis_title=test_display_names[y_var],
         plot_bgcolor='white',
         legend=dict(
             yanchor="top",
@@ -497,6 +510,8 @@ def update_advanced_dropdowns(data):
     if data is None:
         return no_update, no_update
     df = pd.DataFrame(data)
-    numeric_cols = df.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns
-    options = sorted(list(numeric_cols))
+    # Only include numeric columns that are in our lab_columns
+    numeric_cols = [col for col in df.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns 
+                   if col in lab_columns]
+    options = [{'label': test_display_names[col], 'value': col} for col in sorted(numeric_cols)]
     return options, options

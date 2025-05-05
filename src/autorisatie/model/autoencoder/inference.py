@@ -7,6 +7,176 @@ from pathlib import Path
 from .model import Autoencoder
 from sklearn.preprocessing import StandardScaler
 
+def load_model_and_scaler():
+    """Load the trained model and scaler."""
+    # Load best hyperparameters
+    try:
+        with open('../out/model/autoencoder_best_params.pkl', 'rb') as f:
+            params = pickle.load(f)
+    except FileNotFoundError:
+        print("No optimized hyperparameters found. Using default values.")
+        params = {
+            'encoding_dim': 10,
+            'n_layers': 3,
+            'hidden_dim_0': 128,
+            'hidden_dim_1': 64,
+            'hidden_dim_2': 32
+        }
+    
+    # Load scaler
+    with open('../out/model/autoencoder_scaler.pkl', 'rb') as f:
+        scaler = pickle.load(f)
+    
+    # Load max MSE values
+    with open('../out/model/autoencoder_max_mse.pkl', 'rb') as f:
+        max_mse = pickle.load(f)
+    with open('../out/model/autoencoder_max_mse_per_test.pkl', 'rb') as f:
+        max_mse_per_test = pickle.load(f)
+    
+    # Create model with optimized architecture
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = Autoencoder(input_dim=14, encoding_dim=params['encoding_dim'])
+    
+    # Set up encoder layers
+    encoder_layers = []
+    prev_dim = 14
+    for i in range(params['n_layers']):
+        hidden_dim = params[f'hidden_dim_{i}']
+        encoder_layers.extend([
+            torch.nn.Linear(prev_dim, hidden_dim),
+            torch.nn.ReLU()
+        ])
+        prev_dim = hidden_dim
+    encoder_layers.extend([
+        torch.nn.Linear(prev_dim, params['encoding_dim']),
+        torch.nn.ReLU()
+    ])
+    model.encoder = torch.nn.Sequential(*encoder_layers)
+    
+    # Set up decoder layers
+    decoder_layers = []
+    prev_dim = params['encoding_dim']
+    for i in range(params['n_layers']-1, -1, -1):
+        hidden_dim = params[f'hidden_dim_{i}']
+        decoder_layers.extend([
+            torch.nn.Linear(prev_dim, hidden_dim),
+            torch.nn.ReLU()
+        ])
+        prev_dim = hidden_dim
+    decoder_layers.append(torch.nn.Linear(prev_dim, 14))
+    model.decoder = torch.nn.Sequential(*decoder_layers)
+    
+    # Load trained weights
+    model.load_state_dict(torch.load('../out/model/autoencoder_lab_model.pth', map_location=device))
+    model = model.to(device)
+    model.eval()
+    
+    return model, scaler, max_mse, max_mse_per_test
+
+def preprocess_data(data, scaler):
+    """Preprocess the input data."""
+    # Convert to numpy array if it's a pandas DataFrame
+    if isinstance(data, pd.DataFrame):
+        data = data.values
+    
+    # Normalize data
+    data_normalized = data.copy()
+    for i in range(data.shape[1]):
+        mask_col = data_normalized[:, i] != -1
+        if np.sum(mask_col) > 1:
+            data_normalized[mask_col, i] = scaler.transform(
+                data_normalized[mask_col, i].reshape(-1, 1)
+            ).flatten()
+    
+    return data_normalized
+
+def detect_anomalies(data, model, scaler, max_mse, max_mse_per_test, threshold=0.95):
+    """Detect anomalies in the input data."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Preprocess data
+    data_normalized = preprocess_data(data, scaler)
+    
+    # Convert to PyTorch tensor
+    data_tensor = torch.tensor(data_normalized, dtype=torch.float32).to(device)
+    
+    # Get model predictions
+    with torch.no_grad():
+        outputs = model(data_tensor)
+    
+    # Calculate MSE
+    mask = (data_tensor != -1).float()
+    mse = ((outputs - data_tensor) ** 2 * mask).sum(dim=1) / torch.clamp(mask.sum(dim=1), min=1e-10)
+    mse_per_test = ((outputs - data_tensor) ** 2 * mask).cpu().numpy()
+    
+    # Normalize MSE values
+    mse_normalized = mse.cpu().numpy() / max_mse
+    mse_per_test_normalized = mse_per_test / max_mse_per_test
+    
+    # Calculate anomaly scores
+    anomaly_scores = np.max(mse_per_test_normalized, axis=1)
+    
+    # Detect anomalies
+    anomalies = anomaly_scores > threshold
+    
+    return anomalies, anomaly_scores, mse_normalized, mse_per_test_normalized
+
+def get_anomaly_details(data, anomalies, anomaly_scores, mse_per_test_normalized):
+    """Get detailed information about detected anomalies."""
+    # Convert to DataFrame if it's not already
+    if not isinstance(data, pd.DataFrame):
+        data = pd.DataFrame(data)
+    
+    # Get anomalous samples
+    anomalous_data = data[anomalies].copy()
+    anomalous_scores = anomaly_scores[anomalies]
+    anomalous_mse = mse_per_test_normalized[anomalies]
+    
+    # Create detailed report
+    details = []
+    for idx, (_, row) in enumerate(anomalous_data.iterrows()):
+        # Find which tests contributed most to the anomaly
+        test_scores = anomalous_mse[idx]
+        top_tests = np.argsort(test_scores)[-3:][::-1]  # Get top 3 contributing tests
+        
+        detail = {
+            'sample_index': row.name,
+            'anomaly_score': anomalous_scores[idx],
+            'top_contributing_tests': [
+                {
+                    'test_name': data.columns[test_idx],
+                    'value': row.iloc[test_idx],
+                    'contribution': test_scores[test_idx]
+                }
+                for test_idx in top_tests
+            ]
+        }
+        details.append(detail)
+    
+    return details
+
+def analyze_data(data, threshold=0.95):
+    """Analyze data for anomalies and return detailed results."""
+    # Load model and scaler
+    model, scaler, max_mse, max_mse_per_test = load_model_and_scaler()
+    
+    # Detect anomalies
+    anomalies, anomaly_scores, mse_normalized, mse_per_test_normalized = detect_anomalies(
+        data, model, scaler, max_mse, max_mse_per_test, threshold
+    )
+    
+    # Get detailed information about anomalies
+    anomaly_details = get_anomaly_details(
+        data, anomalies, anomaly_scores, mse_per_test_normalized
+    )
+    
+    return {
+        'anomalies_detected': anomalies.sum(),
+        'total_samples': len(data),
+        'anomaly_rate': anomalies.mean(),
+        'anomaly_details': anomaly_details
+    }
+
 class AutoencoderPredictor:
     def __init__(self, model_dir='../out/model'):
         """Initialize the predictor with saved model and scaler."""
